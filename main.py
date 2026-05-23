@@ -49,7 +49,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
 APP_NAME = "Hemisphere Normal Map Hillshade Viewer"
-APP_VERSION = "0.4 - 20260523"
+APP_VERSION = "0.5 - 20260523"
 
 pg.setConfigOptions(imageAxisOrder="row-major")
 
@@ -662,8 +662,8 @@ class LightHemisphereWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.setMinimumSize(230, 230)
-        self.setMaximumSize(300, 300)
+        self.setMinimumSize(200, 200)
+        self.setMaximumSize(240, 240)
 
         self.lx, self.ly, self.lz = az_alt_to_light_vector(315.0, 45.0)
         self.setMouseTracking(True)
@@ -880,6 +880,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         # Image view
         self.graphics = pg.GraphicsLayoutWidget()
+        self.graphics.setMinimumSize(520, 360)
 
         self.view = self.graphics.addViewBox()
         self.view.setAspectLocked(True)
@@ -892,10 +893,25 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         main_layout.addWidget(self.graphics, stretch=1)
 
-        # Right control panel
+        # Right control panel.
+        #
+        # The controls live inside a QScrollArea so that smaller windows,
+        # high-DPI displays, and fullscreen mode do not cause controls to fall
+        # off the bottom of the screen. The panel keeps a sensible fixed width
+        # while the image viewer takes the remaining space.
+        controls_scroll = QtWidgets.QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls_scroll.setFixedWidth(390)
+        controls_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+
         controls = QtWidgets.QWidget()
-        controls.setFixedWidth(370)
+        controls.setMinimumWidth(360)
+        controls.setMaximumWidth(380)
         controls_layout = QtWidgets.QVBoxLayout(controls)
+        controls_layout.setContentsMargins(8, 8, 8, 8)
+        controls_layout.setSpacing(6)
 
         title_label = QtWidgets.QLabel(APP_NAME)
         title_label.setWordWrap(True)
@@ -968,6 +984,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         help_label = QtWidgets.QLabel(
             "Image: mouse wheel = zoom, left-drag = pan.\n"
+            "Control panel: scroll if options do not fit.\n"
             "Light: drag the white dot inside the hemisphere.\n"
             "Center = overhead. Edge = grazing light.\n"
             "Try Flip Y if relief looks inverted.\n\n"
@@ -980,12 +997,14 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         controls_layout.addWidget(help_label)
         controls_layout.addStretch()
 
-        main_layout.addWidget(controls)
+        controls_scroll.setWidget(controls)
+        main_layout.addWidget(controls_scroll)
 
         # Bottom information box
         self.info_box = QtWidgets.QTextEdit()
         self.info_box.setReadOnly(True)
-        self.info_box.setFixedHeight(125)
+        self.info_box.setMinimumHeight(85)
+        self.info_box.setMaximumHeight(115)
         self.info_box.setStyleSheet(
             "QTextEdit { "
             "background: #f7f7f7; "
@@ -1503,7 +1522,10 @@ def main():
         initial_gamma=args.gamma,
     )
 
-    viewer.resize(1500, 1000)
+    # Start in a moderate window size. The user can maximise or go fullscreen
+    # afterwards; the side controls are scrollable so they remain accessible.
+    viewer.resize(1180, 780)
+    viewer.setMinimumSize(900, 620)
     viewer.show()
 
     app.exec()
