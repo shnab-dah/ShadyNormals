@@ -1,20 +1,55 @@
 #!/usr/bin/env python3
+"""
+Hemisphere Normal Map Hillshade Viewer
+======================================
+
+Interactive viewer for rendering low-relief heritage objects from RGB normal maps.
+
+Designed for:
+- coins
+- faded inscriptions
+- seals
+- tablets
+- low-relief carved or stamped surfaces
+
+Features:
+- fast PyQtGraph preview
+- zoom / pan
+- hemisphere light control
+- multiple normal-map enhancement modes
+- full-resolution export
+- PNG/TIFF metadata embedding
+- default output name: {input_filename}_hillshaded.png
+
+Dependencies:
+    pip install numpy pillow pyqtgraph PyQt6
+
+Run:
+    python main.py
+    python main.py normal_map.png
+    python main.py normal_map.png --max-preview-size 1200
+"""
+
+from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import json
 import math
+import re
+from datetime import datetime, timezone
+
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from PIL import TiffImagePlugin
+
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-import json
-from datetime import datetime, timezone
+
 
 APP_NAME = "Hemisphere Normal Map Hillshade Viewer"
-APP_VERSION = "0.1 - 20260523"
-LOGO = "logo.png"
+APP_VERSION = "0.4 - 20260523"
 
 pg.setConfigOptions(imageAxisOrder="row-major")
 
@@ -24,7 +59,107 @@ except AttributeError:
     Signal = QtCore.pyqtSignal
 
 
-def decode_normal_map_from_pil(img):
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
+
+def default_output_for_input(input_path: str | Path | None, suffix: str = "_hillshaded") -> str:
+    """
+    Return default output filename based on input filename.
+
+    Example:
+        coin_normal.png -> coin_normal_hillshaded.png
+    """
+    if not input_path:
+        return "hillshade_output.png"
+
+    path = Path(input_path)
+    return str(path.with_name(f"{path.stem}{suffix}.png"))
+
+
+def safe_mode_name(text: str) -> str:
+    """
+    Convert a render-mode label to a filename-safe suffix.
+    """
+    text = text.lower()
+    text = text.replace("/", " ")
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "render"
+
+
+def clamp01(a: np.ndarray) -> np.ndarray:
+    return np.clip(a, 0.0, 1.0)
+
+
+def normalize_vectors(n: np.ndarray) -> np.ndarray:
+    length = np.linalg.norm(n, axis=2, keepdims=True)
+    return n / np.maximum(length, 1e-8)
+
+
+def normalize_image_float(img: np.ndarray, percentile_clip: bool = True) -> np.ndarray:
+    """
+    Normalize an arbitrary float image to [0, 1] for display/export.
+    Uses robust percentile scaling by default.
+    """
+    img = np.asarray(img, dtype=np.float32)
+
+    finite = np.isfinite(img)
+    if not finite.any():
+        return np.zeros_like(img, dtype=np.float32)
+
+    values = img[finite]
+
+    if percentile_clip:
+        lo, hi = np.percentile(values, [1.0, 99.0])
+    else:
+        lo, hi = float(values.min()), float(values.max())
+
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.float32)
+
+    out = (img - lo) / (hi - lo)
+    return clamp01(out)
+
+
+def to_uint8_gray(img01: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(np.clip(img01 * 255.0, 0, 255).astype(np.uint8))
+
+
+def invert_rendered_uint8(rendered: np.ndarray) -> np.ndarray:
+    """
+    Invert output tones for either grayscale or RGB uint8 renderings.
+    Useful for checking faint low-relief features under reversed tonal contrast.
+    """
+    return np.ascontiguousarray(255 - rendered.astype(np.uint8))
+
+
+def apply_gamma_and_alpha(img01: np.ndarray, alpha: np.ndarray, gamma: float) -> np.ndarray:
+    img01 = clamp01(img01)
+
+    if gamma != 1.0:
+        img01 = img01 ** gamma
+
+    # Composite transparent/background areas onto white
+    img01 = img01 * alpha + (1.0 - alpha) * 1.0
+    return clamp01(img01)
+
+
+def pil_to_qpixmap_scaled(path: Path, width: int, height: int) -> QtGui.QPixmap:
+    pixmap = QtGui.QPixmap(str(path))
+    return pixmap.scaled(
+        width,
+        height,
+        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+        QtCore.Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Normal-map loading and decoding
+# ---------------------------------------------------------------------------
+
+def decode_normal_map_from_pil(img: Image.Image):
     """
     Decode RGB normal map from [0,255] to normalized [-1,1].
 
@@ -32,6 +167,9 @@ def decode_normal_map_from_pil(img):
       R = X
       G = Y
       B = Z
+
+    Returns:
+      nx, ny, nz, alpha
     """
     img = img.convert("RGBA")
     arr = np.asarray(img).astype(np.float32)
@@ -40,9 +178,7 @@ def decode_normal_map_from_pil(img):
     alpha = arr[..., 3] / 255.0
 
     n = rgb * 2.0 - 1.0
-
-    length = np.linalg.norm(n, axis=2, keepdims=True)
-    n = n / np.maximum(length, 1e-8)
+    n = normalize_vectors(n)
 
     n = np.ascontiguousarray(n, dtype=np.float32)
     alpha = np.ascontiguousarray(alpha, dtype=np.float32)
@@ -50,21 +186,26 @@ def decode_normal_map_from_pil(img):
     return n[..., 0], n[..., 1], n[..., 2], alpha
 
 
-def make_preview_image(img, max_preview_size):
+def make_preview_image(img: Image.Image, max_preview_size: int) -> Image.Image:
+    """
+    Resize image for faster interactive preview.
+    Full-resolution data is still used when saving.
+    """
     if max_preview_size <= 0:
         return img.copy()
 
     preview = img.copy()
-    preview.thumbnail(
-        (max_preview_size, max_preview_size),
-        Image.Resampling.LANCZOS
-    )
+    preview.thumbnail((max_preview_size, max_preview_size), Image.Resampling.LANCZOS)
     return preview
 
 
-def az_alt_to_light_vector(azimuth_deg, altitude_deg):
+# ---------------------------------------------------------------------------
+# Light geometry
+# ---------------------------------------------------------------------------
+
+def az_alt_to_light_vector(azimuth_deg: float, altitude_deg: float) -> np.ndarray:
     """
-    Azimuth:
+    Azimuth convention:
       0°   = light from top / north
       90°  = light from right / east
       180° = light from bottom / south
@@ -84,20 +225,198 @@ def az_alt_to_light_vector(azimuth_deg, altitude_deg):
 
     light = np.array([lx, ly, lz], dtype=np.float32)
     light /= np.linalg.norm(light)
-
     return light
 
 
-def light_vector_to_az_alt(lx, ly, lz):
+def light_vector_to_az_alt(lx: float, ly: float, lz: float):
     """
     Convert image-coordinate light vector back to azimuth/altitude.
     """
-    altitude = math.degrees(math.asin(max(-1.0, min(1.0, lz))))
-    azimuth = math.degrees(math.atan2(lx, -ly)) % 360.0
+    altitude = math.degrees(math.asin(max(-1.0, min(1.0, float(lz)))))
+    azimuth = math.degrees(math.atan2(float(lx), -float(ly))) % 360.0
     return azimuth, altitude
 
 
-def hillshade_from_channels(
+def circular_light_vectors(count: int, altitude_deg: float) -> np.ndarray:
+    """
+    Generate evenly spaced lights around the object at a fixed altitude.
+    """
+    count = max(3, int(count))
+    return np.array(
+        [az_alt_to_light_vector(i * 360.0 / count, altitude_deg) for i in range(count)],
+        dtype=np.float32,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fast local box blur, no scipy required
+# ---------------------------------------------------------------------------
+
+def box_blur_2d(img: np.ndarray, radius: int) -> np.ndarray:
+    """
+    Fast box blur using integral image.
+
+    radius = 0 returns the input.
+    Edges are padded with reflection.
+    """
+    radius = int(radius)
+    if radius <= 0:
+        return img.astype(np.float32, copy=False)
+
+    img = np.asarray(img, dtype=np.float32)
+    pad = radius
+    padded = np.pad(img, ((pad, pad), (pad, pad)), mode="reflect")
+
+    # Integral image with zero border
+    integral = np.pad(
+        padded.cumsum(axis=0).cumsum(axis=1),
+        ((1, 0), (1, 0)),
+        mode="constant",
+    )
+
+    k = 2 * radius + 1
+
+    out = (
+        integral[k:, k:]
+        - integral[:-k, k:]
+        - integral[k:, :-k]
+        + integral[:-k, :-k]
+    ) / float(k * k)
+
+    return np.ascontiguousarray(out.astype(np.float32))
+
+
+def box_blur_normals(nx: np.ndarray, ny: np.ndarray, nz: np.ndarray, radius: int):
+    bx = box_blur_2d(nx, radius)
+    by = box_blur_2d(ny, radius)
+    bz = box_blur_2d(nz, radius)
+
+    n = np.stack([bx, by, bz], axis=2)
+    n = normalize_vectors(n)
+
+    return n[..., 0], n[..., 1], n[..., 2]
+
+
+# ---------------------------------------------------------------------------
+# Rendering algorithms
+# ---------------------------------------------------------------------------
+
+RENDER_MODES = [
+    "Single light",
+    "Mean multi-light",
+    "Max multi-light",
+    "Min multi-light",
+    "Range multi-light",
+    "Std-dev multi-light",
+    "RGB 3-light composite",
+    "Slope from normals",
+    "Local normal deviation",
+    "Curvature from normals",
+    "Normal gradient magnitude",
+]
+
+
+def corrected_channels(
+    nx: np.ndarray,
+    ny: np.ndarray,
+    nz: np.ndarray,
+    flip_x: bool,
+    flip_y: bool,
+    flip_z: bool,
+):
+    sx = -1.0 if flip_x else 1.0
+    sy = -1.0 if flip_y else 1.0
+    sz = -1.0 if flip_z else 1.0
+
+    return sx * nx, sy * ny, sz * nz
+
+
+def lambert_shade(
+    nx: np.ndarray,
+    ny: np.ndarray,
+    nz: np.ndarray,
+    light: np.ndarray,
+    ambient: float,
+) -> np.ndarray:
+    """
+    Lambertian normal-map shading for one light vector.
+    Returns float image in [0,1].
+    """
+    lx, ly, lz = light
+    shade = nx * lx + ny * ly + nz * lz
+    shade = np.clip(shade, 0.0, 1.0)
+
+    if ambient > 0:
+        shade = ambient + (1.0 - ambient) * shade
+
+    return clamp01(shade.astype(np.float32))
+
+
+def render_single_light(
+    nx, ny, nz, alpha, light, ambient, gamma, flip_x, flip_y, flip_z
+) -> np.ndarray:
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
+    shade = lambert_shade(nx, ny, nz, light, ambient)
+    shade = apply_gamma_and_alpha(shade, alpha, gamma)
+    return to_uint8_gray(shade)
+
+
+def compute_multi_light_stack(nx, ny, nz, lights, ambient: float):
+    """
+    Return stack of hillshades for many lights.
+    Shape: H x W x N
+    """
+    shades = []
+    for light in lights:
+        shades.append(lambert_shade(nx, ny, nz, light, ambient))
+    return np.stack(shades, axis=2).astype(np.float32)
+
+
+def render_multi_light(
+    nx,
+    ny,
+    nz,
+    alpha,
+    mode: str,
+    light: np.ndarray,
+    ambient: float,
+    gamma: float,
+    flip_x: bool,
+    flip_y: bool,
+    flip_z: bool,
+    multi_count: int,
+) -> np.ndarray:
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
+
+    _, altitude = light_vector_to_az_alt(light[0], light[1], light[2])
+    altitude = max(1.0, min(89.0, altitude))
+
+    lights = circular_light_vectors(multi_count, altitude)
+    stack = compute_multi_light_stack(nx, ny, nz, lights, ambient)
+
+    if mode == "Mean multi-light":
+        out = stack.mean(axis=2)
+        out = normalize_image_float(out, percentile_clip=False)
+    elif mode == "Max multi-light":
+        out = stack.max(axis=2)
+        out = normalize_image_float(out, percentile_clip=False)
+    elif mode == "Min multi-light":
+        out = stack.min(axis=2)
+        out = normalize_image_float(out, percentile_clip=False)
+    elif mode == "Range multi-light":
+        out = stack.max(axis=2) - stack.min(axis=2)
+        out = normalize_image_float(out, percentile_clip=True)
+    elif mode == "Std-dev multi-light":
+        out = stack.std(axis=2)
+        out = normalize_image_float(out, percentile_clip=True)
+    else:
+        raise ValueError(f"Unknown multi-light mode: {mode}")
+
+    out = apply_gamma_and_alpha(out, alpha, gamma)
+    return to_uint8_gray(out)
+
+
+def render_rgb_three_light_composite(
     nx,
     ny,
     nz,
@@ -105,35 +424,227 @@ def hillshade_from_channels(
     light,
     ambient,
     gamma,
-    flip_x=False,
-    flip_y=False,
-    flip_z=False,
-):
-    sx = -1.0 if flip_x else 1.0
-    sy = -1.0 if flip_y else 1.0
-    sz = -1.0 if flip_z else 1.0
+    flip_x,
+    flip_y,
+    flip_z,
+) -> np.ndarray:
+    """
+    Orientation-colour composite from three lights 120 degrees apart.
 
-    lx, ly, lz = light
+    The current hemisphere altitude is reused. The current azimuth becomes the
+    red-channel light. Green and blue are +120° and +240°.
+    """
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
 
-    shade = (
-        sx * nx * lx +
-        sy * ny * ly +
-        sz * nz * lz
+    az, alt = light_vector_to_az_alt(light[0], light[1], light[2])
+    lights = [
+        az_alt_to_light_vector(az, alt),
+        az_alt_to_light_vector((az + 120.0) % 360.0, alt),
+        az_alt_to_light_vector((az + 240.0) % 360.0, alt),
+    ]
+
+    channels = []
+    for l in lights:
+        s = lambert_shade(nx, ny, nz, l, ambient)
+        s = apply_gamma_and_alpha(s, alpha, gamma)
+        channels.append(to_uint8_gray(s))
+
+    rgb = np.stack(channels, axis=2)
+    return np.ascontiguousarray(rgb.astype(np.uint8))
+
+
+def render_slope_from_normals(
+    nx, ny, nz, alpha, gamma, flip_x, flip_y, flip_z
+) -> np.ndarray:
+    """
+    Direction-independent relief strength.
+
+    Equivalent to sin(surface slope), because sqrt(nx^2 + ny^2) is large where
+    the surface normal is tilted away from the camera.
+    """
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
+    slope = np.sqrt(nx * nx + ny * ny)
+    slope = normalize_image_float(slope, percentile_clip=True)
+    slope = apply_gamma_and_alpha(slope, alpha, gamma)
+    return to_uint8_gray(slope)
+
+
+def render_local_normal_deviation(
+    nx,
+    ny,
+    nz,
+    alpha,
+    gamma,
+    flip_x,
+    flip_y,
+    flip_z,
+    local_radius: int,
+) -> np.ndarray:
+    """
+    Highlight local surface disturbance.
+
+    Compares each normal to the locally averaged normal. Useful for faded
+    inscriptions because broad object curvature is suppressed and small local
+    changes are emphasized.
+    """
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
+    bx, by, bz = box_blur_normals(nx, ny, nz, local_radius)
+
+    dot = nx * bx + ny * by + nz * bz
+    dot = np.clip(dot, -1.0, 1.0)
+
+    # angular deviation in radians
+    deviation = np.arccos(dot).astype(np.float32)
+    deviation = normalize_image_float(deviation, percentile_clip=True)
+    deviation = apply_gamma_and_alpha(deviation, alpha, gamma)
+    return to_uint8_gray(deviation)
+
+
+def render_curvature_from_normals(
+    nx,
+    ny,
+    nz,
+    alpha,
+    gamma,
+    flip_x,
+    flip_y,
+    flip_z,
+) -> np.ndarray:
+    """
+    Curvature-like enhancement from normal divergence.
+
+    Not a calibrated curvature measurement, but highly useful as a visual
+    enhancement for incised or raised features.
+
+    Approximation:
+        curvature ≈ d(nx)/dx + d(ny)/dy
+    """
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
+
+    # np.gradient returns d/drow, d/dcol. Row corresponds to y, col to x.
+    dnx_dy, dnx_dx = np.gradient(nx)
+    dny_dy, dny_dx = np.gradient(ny)
+
+    curv = dnx_dx + dny_dy
+
+    # Center zero curvature around mid-gray so positive/negative features differ.
+    scale = np.percentile(np.abs(curv[np.isfinite(curv)]), 99.0)
+    if scale <= 1e-8:
+        out = np.full_like(curv, 0.5, dtype=np.float32)
+    else:
+        out = 0.5 + 0.5 * np.clip(curv / scale, -1.0, 1.0)
+
+    out = apply_gamma_and_alpha(out, alpha, gamma)
+    return to_uint8_gray(out)
+
+
+def render_normal_gradient_magnitude(
+    nx,
+    ny,
+    nz,
+    alpha,
+    gamma,
+    flip_x,
+    flip_y,
+    flip_z,
+) -> np.ndarray:
+    """
+    Edge/feature strength from spatial changes in the normal field.
+    """
+    nx, ny, nz = corrected_channels(nx, ny, nz, flip_x, flip_y, flip_z)
+
+    nx_y, nx_x = np.gradient(nx)
+    ny_y, ny_x = np.gradient(ny)
+    nz_y, nz_x = np.gradient(nz)
+
+    mag = np.sqrt(
+        nx_x * nx_x + nx_y * nx_y
+        + ny_x * ny_x + ny_y * ny_y
+        + nz_x * nz_x + nz_y * nz_y
     )
 
-    shade = np.clip(shade, 0.0, 1.0)
+    mag = normalize_image_float(mag, percentile_clip=True)
+    mag = apply_gamma_and_alpha(mag, alpha, gamma)
+    return to_uint8_gray(mag)
 
-    if ambient > 0:
-        shade = ambient + (1.0 - ambient) * shade
 
-    if gamma != 1.0:
-        shade = np.clip(shade, 0.0, 1.0) ** gamma
+def render_mode_image(
+    nx,
+    ny,
+    nz,
+    alpha,
+    mode: str,
+    light: np.ndarray,
+    ambient: float,
+    gamma: float,
+    flip_x: bool,
+    flip_y: bool,
+    flip_z: bool,
+    multi_count: int,
+    local_radius: int,
+) -> np.ndarray:
+    """
+    Main render dispatch function.
 
-    # Composite transparent/background areas onto white
-    shade = shade * alpha + (1.0 - alpha) * 1.0
+    Returns either:
+      H x W uint8 grayscale
+    or:
+      H x W x 3 uint8 RGB
+    """
+    if mode == "Single light":
+        return render_single_light(
+            nx, ny, nz, alpha, light, ambient, gamma, flip_x, flip_y, flip_z
+        )
 
-    return np.ascontiguousarray(np.clip(shade * 255.0, 0, 255).astype(np.uint8))
+    if mode in {
+        "Mean multi-light",
+        "Max multi-light",
+        "Min multi-light",
+        "Range multi-light",
+        "Std-dev multi-light",
+    }:
+        return render_multi_light(
+            nx,
+            ny,
+            nz,
+            alpha,
+            mode,
+            light,
+            ambient,
+            gamma,
+            flip_x,
+            flip_y,
+            flip_z,
+            multi_count,
+        )
 
+    if mode == "RGB 3-light composite":
+        return render_rgb_three_light_composite(
+            nx, ny, nz, alpha, light, ambient, gamma, flip_x, flip_y, flip_z
+        )
+
+    if mode == "Slope from normals":
+        return render_slope_from_normals(nx, ny, nz, alpha, gamma, flip_x, flip_y, flip_z)
+
+    if mode == "Local normal deviation":
+        return render_local_normal_deviation(
+            nx, ny, nz, alpha, gamma, flip_x, flip_y, flip_z, local_radius
+        )
+
+    if mode == "Curvature from normals":
+        return render_curvature_from_normals(nx, ny, nz, alpha, gamma, flip_x, flip_y, flip_z)
+
+    if mode == "Normal gradient magnitude":
+        return render_normal_gradient_magnitude(
+            nx, ny, nz, alpha, gamma, flip_x, flip_y, flip_z
+        )
+
+    raise ValueError(f"Unknown render mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Hemisphere light selector widget
+# ---------------------------------------------------------------------------
 
 class LightHemisphereWidget(QtWidgets.QWidget):
     """
@@ -155,15 +666,14 @@ class LightHemisphereWidget(QtWidgets.QWidget):
         self.setMaximumSize(300, 300)
 
         self.lx, self.ly, self.lz = az_alt_to_light_vector(315.0, 45.0)
-
         self.setMouseTracking(True)
 
-    def set_from_az_alt(self, azimuth, altitude):
+    def set_from_az_alt(self, azimuth: float, altitude: float):
         self.lx, self.ly, self.lz = az_alt_to_light_vector(azimuth, altitude)
         self.update()
         self.lightChanged.emit(float(self.lx), float(self.ly), float(self.lz))
 
-    def get_light(self):
+    def get_light(self) -> np.ndarray:
         return np.array([self.lx, self.ly, self.lz], dtype=np.float32)
 
     def get_az_alt(self):
@@ -181,6 +691,15 @@ class LightHemisphereWidget(QtWidgets.QWidget):
         cy = h / 2.0
 
         return cx, cy, radius
+
+    @staticmethod
+    def _event_position(event):
+        """
+        PyQt6 uses event.position(); older bindings may use event.pos().
+        """
+        if hasattr(event, "position"):
+            return event.position()
+        return event.pos()
 
     def _set_light_from_position(self, pos):
         cx, cy, radius = self._disk_geometry()
@@ -209,11 +728,11 @@ class LightHemisphereWidget(QtWidgets.QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._set_light_from_position(event.position())
+            self._set_light_from_position(self._event_position(event))
 
     def mouseMoveEvent(self, event):
         if event.buttons() & QtCore.Qt.MouseButton.LeftButton:
-            self._set_light_from_position(event.position())
+            self._set_light_from_position(self._event_position(event))
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -223,12 +742,7 @@ class LightHemisphereWidget(QtWidgets.QWidget):
 
         cx, cy, radius = self._disk_geometry()
 
-        rect = QtCore.QRectF(
-            cx - radius,
-            cy - radius,
-            radius * 2,
-            radius * 2
-        )
+        rect = QtCore.QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
 
         # Hemisphere disk background
         gradient = QtGui.QRadialGradient(QtCore.QPointF(cx, cy), radius)
@@ -242,14 +756,8 @@ class LightHemisphereWidget(QtWidgets.QWidget):
 
         # Crosshair axes
         painter.setPen(QtGui.QPen(QtGui.QColor(120, 120, 120), 1))
-        painter.drawLine(
-            QtCore.QPointF(cx - radius, cy),
-            QtCore.QPointF(cx + radius, cy)
-        )
-        painter.drawLine(
-            QtCore.QPointF(cx, cy - radius),
-            QtCore.QPointF(cx, cy + radius)
-        )
+        painter.drawLine(QtCore.QPointF(cx - radius, cy), QtCore.QPointF(cx + radius, cy))
+        painter.drawLine(QtCore.QPointF(cx, cy - radius), QtCore.QPointF(cx, cy + radius))
 
         # Cardinal labels
         painter.setPen(QtGui.QColor(30, 30, 30))
@@ -257,26 +765,37 @@ class LightHemisphereWidget(QtWidgets.QWidget):
         font.setBold(True)
         painter.setFont(font)
 
-        painter.drawText(QtCore.QRectF(cx - 15, cy - radius - 23, 30, 18),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, "N")
-        painter.drawText(QtCore.QRectF(cx + radius + 5, cy - 9, 24, 18),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, "E")
-        painter.drawText(QtCore.QRectF(cx - 15, cy + radius + 5, 30, 18),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, "S")
-        painter.drawText(QtCore.QRectF(cx - radius - 29, cy - 9, 24, 18),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, "W")
+        painter.drawText(
+            QtCore.QRectF(cx - 15, cy - radius - 23, 30, 18),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            "N",
+        )
+        painter.drawText(
+            QtCore.QRectF(cx + radius + 5, cy - 9, 24, 18),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            "E",
+        )
+        painter.drawText(
+            QtCore.QRectF(cx - 15, cy + radius + 5, 30, 18),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            "S",
+        )
+        painter.drawText(
+            QtCore.QRectF(cx - radius - 29, cy - 9, 24, 18),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            "W",
+        )
 
         # Light position dot
         dot_x = cx + self.lx * radius
         dot_y = cy + self.ly * radius
 
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 2))
+        painter.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(dot_x, dot_y))
+
         painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255)))
         painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0), 2))
         painter.drawEllipse(QtCore.QPointF(dot_x, dot_y), 8, 8)
-
-        # Line from center to light position
-        painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 2))
-        painter.drawLine(QtCore.QPointF(cx, cy), QtCore.QPointF(dot_x, dot_y))
 
         # Text below disk
         az, alt = self.get_az_alt()
@@ -289,16 +808,19 @@ class LightHemisphereWidget(QtWidgets.QWidget):
         painter.drawText(
             QtCore.QRectF(0, self.height() - 24, self.width(), 20),
             QtCore.Qt.AlignmentFlag.AlignCenter,
-            text
+            text,
         )
 
+
+# ---------------------------------------------------------------------------
+# Main viewer
+# ---------------------------------------------------------------------------
 
 class HillshadeViewer(QtWidgets.QMainWindow):
     def __init__(
         self,
         normal_path=None,
-        output_path="interactive_hillshade_fullres.png",
-        logo_path=None,
+        output_path=None,
         max_preview_size=1800,
         initial_azimuth=315.0,
         initial_altitude=45.0,
@@ -308,9 +830,13 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         super().__init__()
 
         self.normal_path = Path(normal_path) if normal_path else None
-        self.output_path = Path(output_path)
-        self.logo_path = Path(LOGO)
-        self.max_preview_size = max_preview_size
+
+        if output_path:
+            self.output_path = Path(output_path)
+        else:
+            self.output_path = Path(default_output_for_input(normal_path))
+
+        self.max_preview_size = int(max_preview_size)
 
         self.full_nx = None
         self.full_ny = None
@@ -325,7 +851,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.preview_size = None
         self.full_size = None
 
-        self.setWindowTitle("Hemisphere Normal Map Hillshade Viewer")
+        self.setWindowTitle(APP_NAME)
 
         self._build_ui(
             initial_azimuth,
@@ -337,7 +863,6 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.update_timer = QtCore.QTimer()
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self.update_image)
-
 
         if self.normal_path:
             self.load_normal_map(self.normal_path)
@@ -355,8 +880,12 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         # Image view
         self.graphics = pg.GraphicsLayoutWidget()
+
         self.view = self.graphics.addViewBox()
         self.view.setAspectLocked(True)
+
+        # Make row 0 display at the top, like a normal image viewer.
+        self.view.invertY(True)
 
         self.image_item = pg.ImageItem(axisOrder="row-major")
         self.view.addItem(self.image_item)
@@ -365,31 +894,40 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         # Right control panel
         controls = QtWidgets.QWidget()
-        controls.setFixedWidth(350)
+        controls.setFixedWidth(370)
         controls_layout = QtWidgets.QVBoxLayout(controls)
 
-        # Logo
-        logo_row = QtWidgets.QHBoxLayout()
-        logo_row.addStretch()
+        title_label = QtWidgets.QLabel(APP_NAME)
+        title_label.setWordWrap(True)
+        title_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        controls_layout.addWidget(title_label)
 
-        self.logo_label = QtWidgets.QLabel()
-        self.logo_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.logo_label.setFixedSize(220, 100)
-        self.logo_label.setStyleSheet(
-            "QLabel { border: 1px solid #999; background: #f5f5f5; }"
-        )
-
-        logo_row.addWidget(self.logo_label)
-        controls_layout.addLayout(logo_row)
+        version_label = QtWidgets.QLabel(APP_VERSION)
+        version_label.setStyleSheet("color: #666;")
+        controls_layout.addWidget(version_label)
 
         # Buttons
         self.load_image_button = QtWidgets.QPushButton("Load image")
-        self.save_button = QtWidgets.QPushButton("Save full-resolution PNG")
+        self.save_button = QtWidgets.QPushButton("Save current render")
+        self.save_16_button = QtWidgets.QPushButton("Save 16 single-light renders")
         self.reset_button = QtWidgets.QPushButton("Reset zoom")
+
+        self.invert_tones_button = QtWidgets.QPushButton("Invert tones: Off")
+        self.invert_tones_button.setCheckable(True)
 
         controls_layout.addWidget(self.load_image_button)
         controls_layout.addWidget(self.save_button)
+        controls_layout.addWidget(self.save_16_button)
         controls_layout.addWidget(self.reset_button)
+        controls_layout.addWidget(self.invert_tones_button)
+
+        # Render mode
+        controls_layout.addSpacing(10)
+        controls_layout.addWidget(QtWidgets.QLabel("Render mode"))
+
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(RENDER_MODES)
+        controls_layout.addWidget(self.mode_combo)
 
         # Hemisphere light control
         controls_layout.addSpacing(10)
@@ -399,16 +937,24 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.light_widget.set_from_az_alt(azimuth, altitude)
         controls_layout.addWidget(self.light_widget, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
-        # Ambient and gamma only
+        # Sliders
         self.ambient_slider = self._make_slider(0, 800, int(ambient * 1000))
         self.gamma_slider = self._make_slider(300, 2500, int(gamma * 1000))
+        self.multi_count_slider = self._make_slider(4, 64, 16)
+        self.local_radius_slider = self._make_slider(1, 80, 12)
 
         controls_layout.addSpacing(10)
         controls_layout.addWidget(QtWidgets.QLabel("Ambient fill"))
         controls_layout.addWidget(self.ambient_slider)
 
-        controls_layout.addWidget(QtWidgets.QLabel("Gamma"))
+        controls_layout.addWidget(QtWidgets.QLabel("Gamma / display contrast"))
         controls_layout.addWidget(self.gamma_slider)
+
+        controls_layout.addWidget(QtWidgets.QLabel("Multi-light directions"))
+        controls_layout.addWidget(self.multi_count_slider)
+
+        controls_layout.addWidget(QtWidgets.QLabel("Local radius"))
+        controls_layout.addWidget(self.local_radius_slider)
 
         # Channel flips
         self.flip_x_box = QtWidgets.QCheckBox("Flip X / Red")
@@ -423,8 +969,10 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         help_label = QtWidgets.QLabel(
             "Image: mouse wheel = zoom, left-drag = pan.\n"
             "Light: drag the white dot inside the hemisphere.\n"
-            "Center = overhead light. Edge = grazing light.\n"
-            "Try Flip Y if relief looks inverted."
+            "Center = overhead. Edge = grazing light.\n"
+            "Try Flip Y if relief looks inverted.\n\n"
+            "For inscriptions, try Range multi-light, Std-dev multi-light, "
+            "Local normal deviation, or Curvature from normals."
         )
         help_label.setWordWrap(True)
 
@@ -437,7 +985,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         # Bottom information box
         self.info_box = QtWidgets.QTextEdit()
         self.info_box.setReadOnly(True)
-        self.info_box.setFixedHeight(105)
+        self.info_box.setFixedHeight(125)
         self.info_box.setStyleSheet(
             "QTextEdit { "
             "background: #f7f7f7; "
@@ -451,8 +999,11 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         # Signals
         self.light_widget.lightChanged.connect(self.request_update)
+        self.mode_combo.currentTextChanged.connect(self.request_update)
         self.ambient_slider.valueChanged.connect(self.request_update)
         self.gamma_slider.valueChanged.connect(self.request_update)
+        self.multi_count_slider.valueChanged.connect(self.request_update)
+        self.local_radius_slider.valueChanged.connect(self.request_update)
 
         self.flip_x_box.stateChanged.connect(self.request_update)
         self.flip_y_box.stateChanged.connect(self.request_update)
@@ -460,55 +1011,23 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         self.load_image_button.clicked.connect(self.choose_image)
         self.save_button.clicked.connect(self.save_full_resolution)
+        self.save_16_button.clicked.connect(self.save_16_single_light_renders)
         self.reset_button.clicked.connect(lambda: self.view.autoRange())
+        self.invert_tones_button.toggled.connect(self.toggle_invert_tones)
 
-    def _make_slider(self, minimum, maximum, value):
+    @staticmethod
+    def _make_slider(minimum, maximum, value):
         slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        slider.setMinimum(minimum)
-        slider.setMaximum(maximum)
-        slider.setValue(value)
+        slider.setMinimum(int(minimum))
+        slider.setMaximum(int(maximum))
+        slider.setValue(int(value))
         slider.setSingleStep(1)
         slider.setPageStep(10)
         return slider
 
-    def set_logo(self, logo_path):
-        logo_path = Path(logo_path)
-
-        if not logo_path.exists():
-            self.set_logo_placeholder()
-            self.set_info(f"Logo not found: {logo_path}")
-            return
-
-        pixmap = QtGui.QPixmap(str(logo_path))
-
-        if pixmap.isNull():
-            self.set_logo_placeholder()
-            self.set_info(f"Could not load logo: {logo_path}")
-            return
-
-        # Size of the logo display box in the UI
-        target_width = self.logo_label.width()
-        target_height = self.logo_label.height()
-
-        # Scale down to fit, preserving aspect ratio.
-        # Qt will not stretch the image beyond the target box.
-        scaled = pixmap.scaled(
-            target_width,
-            target_height,
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-            QtCore.Qt.TransformationMode.SmoothTransformation,
-        )
-
-        self.logo_label.setPixmap(scaled)
-        self.logo_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.logo_label.setStyleSheet(
-            "QLabel { "
-            "border: 0px; "
-            "background: transparent; "
-            "}"
-        )
-
-        self.logo_path = logo_path
+    def toggle_invert_tones(self, checked: bool):
+        self.invert_tones_button.setText("Invert tones: On" if checked else "Invert tones: Off")
+        self.request_update()
 
     def choose_image(self):
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -540,10 +1059,12 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.nx, self.ny, self.nz, self.alpha = decode_normal_map_from_pil(preview_img)
 
         self.normal_path = path
+        self.output_path = Path(default_output_for_input(path))
+
         self.preview_size = preview_img.size
         self.full_size = full_img.size
 
-        self.setWindowTitle(f"Hemisphere Normal Map Hillshade Viewer — {path.name}")
+        self.setWindowTitle(f"{APP_NAME} — {path.name}")
 
         self.update_image()
         self.view.autoRange()
@@ -554,12 +1075,29 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         ambient = self.ambient_slider.value() / 1000.0
         gamma = self.gamma_slider.value() / 1000.0
+        multi_count = int(self.multi_count_slider.value())
+        local_radius = int(self.local_radius_slider.value())
 
         flip_x = self.flip_x_box.isChecked()
         flip_y = self.flip_y_box.isChecked()
         flip_z = self.flip_z_box.isChecked()
 
-        return light, ambient, gamma, flip_x, flip_y, flip_z
+        invert_tones = self.invert_tones_button.isChecked()
+
+        mode = self.mode_combo.currentText()
+
+        return {
+            "mode": mode,
+            "light": light,
+            "ambient": ambient,
+            "gamma": gamma,
+            "multi_count": multi_count,
+            "local_radius": local_radius,
+            "flip_x": flip_x,
+            "flip_y": flip_y,
+            "flip_z": flip_z,
+            "invert_tones": invert_tones,
+        }
 
     def request_update(self, *args):
         if self.nx is None:
@@ -568,27 +1106,66 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         # Small debounce improves responsiveness during rapid dragging.
         self.update_timer.start(10)
 
-    def update_image(self):
-        if self.nx is None:
-            return
+    def render_current_preview(self) -> np.ndarray:
+        params = self.get_params()
 
-        light, ambient, gamma, flip_x, flip_y, flip_z = self.get_params()
-
-        shade = hillshade_from_channels(
+        rendered = render_mode_image(
             self.nx,
             self.ny,
             self.nz,
             self.alpha,
-            light,
-            ambient,
-            gamma,
-            flip_x,
-            flip_y,
-            flip_z,
+            mode=params["mode"],
+            light=params["light"],
+            ambient=params["ambient"],
+            gamma=params["gamma"],
+            flip_x=params["flip_x"],
+            flip_y=params["flip_y"],
+            flip_z=params["flip_z"],
+            multi_count=params["multi_count"],
+            local_radius=params["local_radius"],
         )
 
+        if params["invert_tones"]:
+            rendered = invert_rendered_uint8(rendered)
+
+        return rendered
+
+    def render_current_fullres(self) -> np.ndarray:
+        params = self.get_params()
+
+        rendered = render_mode_image(
+            self.full_nx,
+            self.full_ny,
+            self.full_nz,
+            self.full_alpha,
+            mode=params["mode"],
+            light=params["light"],
+            ambient=params["ambient"],
+            gamma=params["gamma"],
+            flip_x=params["flip_x"],
+            flip_y=params["flip_y"],
+            flip_z=params["flip_z"],
+            multi_count=params["multi_count"],
+            local_radius=params["local_radius"],
+        )
+
+        if params["invert_tones"]:
+            rendered = invert_rendered_uint8(rendered)
+
+        return rendered
+
+    def update_image(self):
+        if self.nx is None:
+            return
+
+        try:
+            rendered = self.render_current_preview()
+        except Exception as exc:
+            self.set_info(f"Render error:\n{exc}")
+            return
+
         self.image_item.setImage(
-            shade,
+            rendered,
             autoLevels=False,
             levels=(0, 255),
         )
@@ -600,20 +1177,22 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             self.set_info("No image loaded. Click “Load image” to choose an RGB normal map.")
             return
 
-        light, ambient, gamma, flip_x, flip_y, flip_z = self.get_params()
+        params = self.get_params()
+        light = params["light"]
         azimuth, altitude = light_vector_to_az_alt(light[0], light[1], light[2])
-
-        logo_text = str(self.logo_path) if self.logo_path else "No logo loaded"
 
         lines = [
             f"Image: {self.normal_path}",
             f"Preview size: {self.preview_size[0]} × {self.preview_size[1]} px    "
             f"Full size: {self.full_size[0]} × {self.full_size[1]} px",
+            f"Mode: {params['mode']}",
             f"Light vector: X {light[0]:+.3f}    Y {light[1]:+.3f}    Z {light[2]:+.3f}",
             f"Azimuth: {azimuth:.1f}°    Altitude: {altitude:.1f}°    "
-            f"Ambient: {ambient:.2f}    Gamma: {gamma:.2f}    "
-            f"Flip X: {flip_x}    Flip Y: {flip_y}    Flip Z: {flip_z}",
-            f"Logo: {logo_text}",
+            f"Ambient: {params['ambient']:.2f}    Gamma: {params['gamma']:.2f}    "
+            f"Multi-count: {params['multi_count']}    Local radius: {params['local_radius']}",
+            f"Flip X: {params['flip_x']}    Flip Y: {params['flip_y']}    Flip Z: {params['flip_z']}    "
+            f"Invert tones: {params['invert_tones']}",
+            f"Default output: {self.output_path}",
         ]
 
         if extra:
@@ -622,21 +1201,29 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.set_info("\n".join(lines))
 
     def set_info(self, text):
-        self.info_box.setPlainText(text)
+        self.info_box.setPlainText(str(text))
 
-    def build_processing_metadata(self):
-        light, ambient, gamma, flip_x, flip_y, flip_z = self.get_params()
+    def build_processing_metadata(self, mode_override=None, light_override=None):
+        params = self.get_params()
+
+        mode = mode_override if mode_override is not None else params["mode"]
+        light = light_override if light_override is not None else params["light"]
+
         azimuth, altitude = light_vector_to_az_alt(light[0], light[1], light[2])
 
         metadata = {
             "Software": APP_NAME,
             "SoftwareVersion": APP_VERSION,
-            "Processing": "Direct hillshade from RGB normal map",
-            "Algorithm": "Lambertian dot product between decoded normal vector and user-selected light vector",
+            "Processing": "Render from RGB normal map",
+            "RenderMode": mode,
+            "Algorithm": (
+                "RGB normal map decoded from [0,255] to [-1,+1], normalized per pixel, "
+                "then rendered using the selected normal-domain visualisation mode."
+            ),
             "SourceNormalMap": str(self.normal_path),
             "ExportedAtUTC": datetime.now(timezone.utc).isoformat(),
 
-            "NormalMapConvention": "RGB normal map decoded from [0,255] to [-1,+1], then normalized per pixel",
+            "NormalMapConvention": "R=X, G=Y, B=Z; decoded from [0,255] to [-1,+1]",
             "NormalChannelR": "X",
             "NormalChannelG": "Y",
             "NormalChannelB": "Z",
@@ -647,27 +1234,44 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             "AzimuthDegrees": float(azimuth),
             "AltitudeDegrees": float(altitude),
 
-            "AmbientFill": float(ambient),
-            "Gamma": float(gamma),
+            "AmbientFill": float(params["ambient"]),
+            "Gamma": float(params["gamma"]),
+            "MultiLightDirections": int(params["multi_count"]),
+            "LocalRadiusPixels": int(params["local_radius"]),
 
-            "FlipX_Red": bool(flip_x),
-            "FlipY_Green": bool(flip_y),
-            "FlipZ_Blue": bool(flip_z),
+            "FlipX_Red": bool(params["flip_x"]),
+            "FlipY_Green": bool(params["flip_y"]),
+            "FlipZ_Blue": bool(params["flip_z"]),
+            "InvertTones": bool(params["invert_tones"]),
 
-            "PreviewWidth": int(self.preview_size[0]),
-            "PreviewHeight": int(self.preview_size[1]),
-            "FullWidth": int(self.full_size[0]),
-            "FullHeight": int(self.full_size[1]),
-
-            "LogoPath": str(self.logo_path),
+            "PreviewWidth": int(self.preview_size[0]) if self.preview_size else None,
+            "PreviewHeight": int(self.preview_size[1]) if self.preview_size else None,
+            "FullWidth": int(self.full_size[0]) if self.full_size else None,
+            "FullHeight": int(self.full_size[1]) if self.full_size else None,
         }
 
         return metadata
 
-    def save_image_with_metadata(self, shade, output_path):
+    def save_image_with_metadata(
+        self,
+        rendered: np.ndarray,
+        output_path: Path,
+        mode_override=None,
+        light_override=None,
+    ):
         output_path = Path(output_path)
-        img = Image.fromarray(shade)
-        metadata = self.build_processing_metadata()
+
+        if rendered.ndim == 2:
+            img = Image.fromarray(rendered, mode="L")
+        elif rendered.ndim == 3 and rendered.shape[2] == 3:
+            img = Image.fromarray(rendered, mode="RGB")
+        else:
+            raise ValueError(f"Unsupported rendered image shape: {rendered.shape}")
+
+        metadata = self.build_processing_metadata(
+            mode_override=mode_override,
+            light_override=light_override,
+        )
 
         suffix = output_path.suffix.lower()
 
@@ -677,41 +1281,35 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             for key, value in metadata.items():
                 pnginfo.add_text(str(key), str(value))
 
-            pnginfo.add_text(
-                "ProcessingJSON",
-                json.dumps(metadata, indent=2)
-            )
-
+            pnginfo.add_text("ProcessingJSON", json.dumps(metadata, indent=2))
             img.save(output_path, pnginfo=pnginfo)
 
         elif suffix in [".tif", ".tiff"]:
             ifd = TiffImagePlugin.ImageFileDirectory_v2()
             ifd[270] = json.dumps(metadata, indent=2)  # ImageDescription
-            ifd[305] = APP_NAME  # Software
-
+            ifd[305] = APP_NAME                       # Software
             img.save(output_path, tiffinfo=ifd)
 
         else:
             # Other formats may not preserve metadata reliably.
             # Save the image and write a sidecar JSON file.
             img.save(output_path)
-
             sidecar_path = output_path.with_suffix(output_path.suffix + ".metadata.json")
-            sidecar_path.write_text(
-                json.dumps(metadata, indent=2),
-                encoding="utf-8"
-            )
-
+            sidecar_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     def save_full_resolution(self):
         if self.full_nx is None:
             self.set_info("No image loaded. Cannot save.")
             return
 
+        mode = self.mode_combo.currentText()
+        suffix = f"_{safe_mode_name(mode)}"
+        suggested = Path(default_output_for_input(self.normal_path, suffix=suffix))
+
         filename, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Save full-resolution hillshade",
-            str(self.output_path),
+            "Save full-resolution render",
+            str(suggested),
             "PNG image (*.png);;TIFF image (*.tif *.tiff);;All files (*)",
         )
 
@@ -720,53 +1318,159 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         self.output_path = Path(filename)
 
-        light, ambient, gamma, flip_x, flip_y, flip_z = self.get_params()
+        try:
+            rendered = self.render_current_fullres()
+            self.save_image_with_metadata(rendered, self.output_path)
+        except Exception as exc:
+            self.update_info_box(extra=f"Save error: {exc}")
+            return
 
-        shade = hillshade_from_channels(
-            self.full_nx,
-            self.full_ny,
-            self.full_nz,
-            self.full_alpha,
-            light,
-            ambient,
-            gamma,
-            flip_x,
-            flip_y,
-            flip_z,
+        self.update_info_box(extra=f"Saved full-resolution render: {self.output_path}")
+        print(f"Saved full-resolution render: {self.output_path}")
+
+    def save_16_single_light_renders(self):
+        """
+        Save 16 traditional raking-light hillshades at evenly spaced azimuths.
+        Uses the current altitude, ambient, gamma, and flip settings.
+        """
+        if self.full_nx is None:
+            self.set_info("No image loaded. Cannot save.")
+            return
+
+        default_dir = str(Path(self.normal_path).with_name(f"{Path(self.normal_path).stem}_16_hillshades"))
+
+        outdir = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Choose folder for 16 hillshade renders",
+            default_dir,
         )
 
-        self.save_image_with_metadata(shade, self.output_path)
-        azimuth, altitude = light_vector_to_az_alt(light[0], light[1], light[2])
+        if not outdir:
+            return
 
-        self.update_info_box(extra=f"Saved full-resolution hillshade: {self.output_path}")
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
 
-        print(f"Saved full-resolution hillshade: {self.output_path}")
-        print(f"Light vector: X {light[0]:+.3f}, Y {light[1]:+.3f}, Z {light[2]:+.3f}")
-        print(f"Azimuth: {azimuth:.1f}°")
-        print(f"Altitude: {altitude:.1f}°")
-        print(f"Ambient: {ambient:.2f}")
-        print(f"Gamma: {gamma:.2f}")
-        print(f"Flip X: {flip_x}")
-        print(f"Flip Y: {flip_y}")
-        print(f"Flip Z: {flip_z}")
+        params = self.get_params()
+        _, altitude = light_vector_to_az_alt(
+            params["light"][0],
+            params["light"][1],
+            params["light"][2],
+        )
 
+        contact_images = []
+        labels = []
+
+        original_mode = self.mode_combo.currentText()
+
+        for i in range(16):
+            az = i * 22.5
+            light = az_alt_to_light_vector(az, altitude)
+
+            rendered = render_single_light(
+                self.full_nx,
+                self.full_ny,
+                self.full_nz,
+                self.full_alpha,
+                light,
+                params["ambient"],
+                params["gamma"],
+                params["flip_x"],
+                params["flip_y"],
+                params["flip_z"],
+            )
+
+            if params["invert_tones"]:
+                rendered = invert_rendered_uint8(rendered)
+
+            az_label = f"{az:05.1f}".replace(".", "p")
+            output_path = outdir / f"{Path(self.normal_path).stem}_hillshade_az_{az_label}_alt_{altitude:.1f}.png"
+
+            self.save_image_with_metadata(
+                rendered,
+                output_path,
+                mode_override="Single light",
+                light_override=light,
+            )
+
+            # Make small thumbnails for contact sheet
+            thumb = Image.fromarray(rendered, mode="L")
+            thumb.thumbnail((360, 360), Image.Resampling.LANCZOS)
+            contact_images.append(thumb.copy())
+            labels.append(f"Az {az:.1f}°")
+
+        self.save_contact_sheet(contact_images, labels, outdir / f"{Path(self.normal_path).stem}_contact_sheet.png")
+
+        self.update_info_box(extra=f"Saved 16 hillshades to: {outdir}")
+        print(f"Saved 16 hillshades to: {outdir}")
+
+    def save_contact_sheet(self, pil_images, labels, out_path: Path, cols: int = 4):
+        if not pil_images:
+            return
+
+        w, h = pil_images[0].size
+        label_h = 28
+        rows = int(math.ceil(len(pil_images) / cols))
+
+        sheet = Image.new("L", (cols * w, rows * (h + label_h)), 255)
+        draw = ImageDrawSafe(sheet)
+
+        for i, img in enumerate(pil_images):
+            col = i % cols
+            row = i // cols
+
+            x = col * w
+            y = row * (h + label_h)
+
+            sheet.paste(img.convert("L"), (x, y + label_h))
+            draw.text((x + 8, y + 7), labels[i], fill=0)
+
+        # Minimal metadata for contact sheet
+        metadata = self.build_processing_metadata(mode_override="16 single-light contact sheet")
+
+        pnginfo = PngInfo()
+        pnginfo.add_text("ProcessingJSON", json.dumps(metadata, indent=2))
+        pnginfo.add_text("Software", APP_NAME)
+        pnginfo.add_text("RenderMode", "16 single-light contact sheet")
+
+        sheet.save(out_path, pnginfo=pnginfo)
+
+
+class ImageDrawSafe:
+    """
+    Tiny wrapper around PIL ImageDraw imported lazily.
+
+    Keeps top-level imports compact and avoids font dependencies.
+    """
+    def __init__(self, image):
+        from PIL import ImageDraw
+        self.draw = ImageDraw.Draw(image)
+
+    def text(self, *args, **kwargs):
+        return self.draw.text(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fast zoomable hemisphere-light hillshade viewer for RGB normal maps."
+        description="Fast zoomable hemisphere-light viewer for RGB normal maps."
     )
 
     parser.add_argument(
         "normal_map",
         nargs="?",
         default=None,
-        help="Optional input RGB normal map"
+        help="Optional input RGB normal map",
     )
+
     parser.add_argument(
         "-o",
         "--output",
-        default="interactive_hillshade_fullres.png",
-        help="Default output path when saving"
+        default=None,
+        help="Default output path when saving. If omitted, uses {input_filename}_hillshaded.png",
     )
 
     parser.add_argument(
@@ -777,8 +1481,9 @@ def main():
             "Maximum width/height of interactive preview. "
             "Lower this for faster performance, e.g. 1200. "
             "Use 0 for full-resolution preview."
-        )
+        ),
     )
+
     parser.add_argument("--azimuth", type=float, default=315.0)
     parser.add_argument("--altitude", type=float, default=45.0)
     parser.add_argument("--ambient", type=float, default=0.15)
@@ -798,7 +1503,7 @@ def main():
         initial_gamma=args.gamma,
     )
 
-    viewer.resize(1450, 980)
+    viewer.resize(1500, 1000)
     viewer.show()
 
     app.exec()
