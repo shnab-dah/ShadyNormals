@@ -49,7 +49,9 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
 APP_NAME = "Hemisphere Normal Map Hillshade Viewer"
-APP_VERSION = "ALPHA 0.1 - 20260523"
+APP_VERSION = "0.7 - 20260523"
+DEVELOPER_CREDIT = "Developed by Sjors Nab (Utrecht University ArtLab, s.h.nab@uu.nl)"
+LOGO_FILENAME = "logo.png"
 
 pg.setConfigOptions(imageAxisOrder="row-major")
 
@@ -75,6 +77,28 @@ def default_output_for_input(input_path: str | Path | None, suffix: str = "_hill
 
     path = Path(input_path)
     return str(path.with_name(f"{path.stem}{suffix}.png"))
+
+
+def find_logo_path() -> Path | None:
+    """
+    Find logo.png next to the script file, falling back to the current working
+    directory. This keeps deployment simple: place logo.png in the same folder
+    as this Python file.
+    """
+    candidates = []
+
+    try:
+        candidates.append(Path(__file__).resolve().with_name(LOGO_FILENAME))
+    except NameError:
+        pass
+
+    candidates.append(Path.cwd() / LOGO_FILENAME)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return None
 
 
 def safe_mode_name(text: str) -> str:
@@ -851,6 +875,12 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.preview_size = None
         self.full_size = None
 
+        # Prevent feedback loops when the hemisphere and azimuth/altitude
+        # sliders update each other.
+        self._syncing_light_controls = False
+
+        self._processing_message = ""
+
         self.setWindowTitle(APP_NAME)
 
         self._build_ui(
@@ -913,14 +943,35 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         controls_layout.setContentsMargins(8, 8, 8, 8)
         controls_layout.setSpacing(6)
 
+        header_row = QtWidgets.QHBoxLayout()
+
+        header_text = QtWidgets.QWidget()
+        header_text_layout = QtWidgets.QVBoxLayout(header_text)
+        header_text_layout.setContentsMargins(0, 0, 0, 0)
+        header_text_layout.setSpacing(2)
+
         title_label = QtWidgets.QLabel(APP_NAME)
         title_label.setWordWrap(True)
         title_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        controls_layout.addWidget(title_label)
+        header_text_layout.addWidget(title_label)
 
         version_label = QtWidgets.QLabel(APP_VERSION)
         version_label.setStyleSheet("color: #666;")
-        controls_layout.addWidget(version_label)
+        header_text_layout.addWidget(version_label)
+
+        header_row.addWidget(header_text, stretch=1)
+
+        self.logo_label = QtWidgets.QLabel()
+        self.logo_label.setFixedSize(92, 52)
+        self.logo_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.logo_label.setStyleSheet(
+            "QLabel { background: transparent; border: 0px; }"
+        )
+        header_row.addWidget(self.logo_label)
+
+        controls_layout.addLayout(header_row)
+
+        self.load_logo_from_file()
 
         # Buttons
         self.load_image_button = QtWidgets.QPushButton("Load image")
@@ -936,6 +987,18 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.save_16_button)
         controls_layout.addWidget(self.reset_button)
         controls_layout.addWidget(self.invert_tones_button)
+
+        self.processing_label = QtWidgets.QLabel("Ready")
+        self.processing_label.setWordWrap(True)
+        self.processing_label.setStyleSheet(
+            "QLabel { "
+            "background: #eef5ee; "
+            "border: 1px solid #9ab99a; "
+            "padding: 5px; "
+            "color: #234b23; "
+            "}"
+        )
+        controls_layout.addWidget(self.processing_label)
 
         # Render mode
         controls_layout.addSpacing(10)
@@ -953,11 +1016,22 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.light_widget.set_from_az_alt(azimuth, altitude)
         controls_layout.addWidget(self.light_widget, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
-        # Sliders
+        # Azimuth / altitude sliders are kept in sync with the hemisphere.
+        self.azimuth_slider = self._make_slider(0, 3600, int(azimuth * 10))
+        self.altitude_slider = self._make_slider(0, 900, int(altitude * 10))
+
+        controls_layout.addWidget(QtWidgets.QLabel("Azimuth"))
+        controls_layout.addWidget(self.azimuth_slider)
+
+        controls_layout.addWidget(QtWidgets.QLabel("Altitude"))
+        controls_layout.addWidget(self.altitude_slider)
+
+        # Sliders and numeric inputs
         self.ambient_slider = self._make_slider(0, 800, int(ambient * 1000))
         self.gamma_slider = self._make_slider(300, 2500, int(gamma * 1000))
-        self.multi_count_slider = self._make_slider(4, 64, 16)
-        self.local_radius_slider = self._make_slider(1, 80, 12)
+
+        self.multi_count_input = self._make_spinbox(4, 32, 16)
+        self.local_radius_input = self._make_spinbox(1, 150, 12)
 
         controls_layout.addSpacing(10)
         controls_layout.addWidget(QtWidgets.QLabel("Ambient fill"))
@@ -967,10 +1041,10 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.gamma_slider)
 
         controls_layout.addWidget(QtWidgets.QLabel("Multi-light directions"))
-        controls_layout.addWidget(self.multi_count_slider)
+        controls_layout.addWidget(self.multi_count_input)
 
         controls_layout.addWidget(QtWidgets.QLabel("Local radius"))
-        controls_layout.addWidget(self.local_radius_slider)
+        controls_layout.addWidget(self.local_radius_input)
 
         # Channel flips
         self.flip_x_box = QtWidgets.QCheckBox("Flip X / Red")
@@ -1016,13 +1090,29 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         )
         outer_layout.addWidget(self.info_box)
 
+        self.colofon_bar = QtWidgets.QLabel(f"{APP_NAME} — {APP_VERSION} | {DEVELOPER_CREDIT}")
+        self.colofon_bar.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.colofon_bar.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.colofon_bar.setStyleSheet(
+            "QLabel { "
+            "background: #2b2b2b; "
+            "color: #f2f2f2; "
+            "padding: 5px; "
+            "font-size: 11px; "
+            "}"
+        )
+        outer_layout.addWidget(self.colofon_bar)
+
         # Signals
-        self.light_widget.lightChanged.connect(self.request_update)
+        self.light_widget.lightChanged.connect(self.on_light_widget_changed)
+        self.azimuth_slider.valueChanged.connect(self.on_az_alt_slider_changed)
+        self.altitude_slider.valueChanged.connect(self.on_az_alt_slider_changed)
+
         self.mode_combo.currentTextChanged.connect(self.request_update)
         self.ambient_slider.valueChanged.connect(self.request_update)
         self.gamma_slider.valueChanged.connect(self.request_update)
-        self.multi_count_slider.valueChanged.connect(self.request_update)
-        self.local_radius_slider.valueChanged.connect(self.request_update)
+        self.multi_count_input.valueChanged.connect(self.request_update)
+        self.local_radius_input.valueChanged.connect(self.request_update)
 
         self.flip_x_box.stateChanged.connect(self.request_update)
         self.flip_y_box.stateChanged.connect(self.request_update)
@@ -1034,6 +1124,72 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.reset_button.clicked.connect(lambda: self.view.autoRange())
         self.invert_tones_button.toggled.connect(self.toggle_invert_tones)
 
+    def load_logo_from_file(self):
+        """
+        Load logo.png from the application folder and scale it to fit the
+        top-right header area without distorting the aspect ratio.
+        """
+        logo_path = find_logo_path()
+
+        if logo_path is None:
+            self.logo_label.setText("")
+            self.logo_label.setToolTip(f"No {LOGO_FILENAME} found next to the application file.")
+            return
+
+        pixmap = QtGui.QPixmap(str(logo_path))
+
+        if pixmap.isNull():
+            self.logo_label.setText("")
+            self.logo_label.setToolTip(f"Could not load logo: {logo_path}")
+            return
+
+        scaled = pixmap.scaled(
+            self.logo_label.width(),
+            self.logo_label.height(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+
+        self.logo_label.setPixmap(scaled)
+        self.logo_label.setToolTip(str(logo_path))
+
+    def set_busy(self, message: str | None = None):
+        """
+        Give visible feedback during longer operations such as full-resolution
+        export and batch processing. This also forces the UI to repaint before
+        the computation starts.
+        """
+        if message:
+            self._processing_message = message
+            self.processing_label.setText(message)
+            self.processing_label.setStyleSheet(
+                "QLabel { "
+                "background: #fff3cd; "
+                "border: 1px solid #d6b656; "
+                "padding: 5px; "
+                "color: #5b4500; "
+                "font-weight: bold; "
+                "}"
+            )
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        else:
+            self._processing_message = ""
+            self.processing_label.setText("Ready")
+            self.processing_label.setStyleSheet(
+                "QLabel { "
+                "background: #eef5ee; "
+                "border: 1px solid #9ab99a; "
+                "padding: 5px; "
+                "color: #234b23; "
+                "}"
+            )
+            try:
+                QtWidgets.QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+
+        QtWidgets.QApplication.processEvents()
+
     @staticmethod
     def _make_slider(minimum, maximum, value):
         slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -1043,6 +1199,49 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         slider.setSingleStep(1)
         slider.setPageStep(10)
         return slider
+
+    @staticmethod
+    def _make_spinbox(minimum, maximum, value):
+        spinbox = QtWidgets.QSpinBox()
+        spinbox.setMinimum(int(minimum))
+        spinbox.setMaximum(int(maximum))
+        spinbox.setValue(int(value))
+        spinbox.setSingleStep(1)
+        spinbox.setKeyboardTracking(False)
+        return spinbox
+
+    def on_light_widget_changed(self, lx: float, ly: float, lz: float):
+        """
+        Update azimuth/altitude sliders when the hemisphere control changes.
+        """
+        if self._syncing_light_controls:
+            self.request_update()
+            return
+
+        self._syncing_light_controls = True
+
+        azimuth, altitude = light_vector_to_az_alt(lx, ly, lz)
+        self.azimuth_slider.setValue(int(round(azimuth * 10)))
+        self.altitude_slider.setValue(int(round(altitude * 10)))
+
+        self._syncing_light_controls = False
+        self.request_update()
+
+    def on_az_alt_slider_changed(self, *args):
+        """
+        Update the hemisphere control when either azimuth or altitude slider changes.
+        """
+        if self._syncing_light_controls:
+            return
+
+        self._syncing_light_controls = True
+
+        azimuth = self.azimuth_slider.value() / 10.0
+        altitude = self.altitude_slider.value() / 10.0
+        self.light_widget.set_from_az_alt(azimuth, altitude)
+
+        self._syncing_light_controls = False
+        self.request_update()
 
     def toggle_invert_tones(self, checked: bool):
         self.invert_tones_button.setText("Invert tones: On" if checked else "Invert tones: Off")
@@ -1094,8 +1293,8 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         ambient = self.ambient_slider.value() / 1000.0
         gamma = self.gamma_slider.value() / 1000.0
-        multi_count = int(self.multi_count_slider.value())
-        local_radius = int(self.local_radius_slider.value())
+        multi_count = int(self.multi_count_input.value())
+        local_radius = int(self.local_radius_input.value())
 
         flip_x = self.flip_x_box.isChecked()
         flip_y = self.flip_y_box.isChecked()
@@ -1178,9 +1377,11 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             return
 
         try:
+            self.set_busy("Rendering preview…")
             rendered = self.render_current_preview()
         except Exception as exc:
             self.set_info(f"Render error:\n{exc}")
+            self.set_busy(None)
             return
 
         self.image_item.setImage(
@@ -1190,6 +1391,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         )
 
         self.update_info_box()
+        self.set_busy(None)
 
     def update_info_box(self, extra=None):
         if self.normal_path is None:
@@ -1338,13 +1540,22 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.output_path = Path(filename)
 
         try:
+            self.set_busy("Calculating and saving full-resolution render…")
+            self.update_info_box(extra="Saving is in progress; the application has not finished yet.")
             rendered = self.render_current_fullres()
             self.save_image_with_metadata(rendered, self.output_path)
         except Exception as exc:
             self.update_info_box(extra=f"Save error: {exc}")
             return
+        finally:
+            self.set_busy(None)
 
         self.update_info_box(extra=f"Saved full-resolution render: {self.output_path}")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Save complete",
+            f"Saved full-resolution render:\n{self.output_path}",
+        )
         print(f"Saved full-resolution render: {self.output_path}")
 
     def save_16_single_light_renders(self):
@@ -1377,50 +1588,100 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             params["light"][2],
         )
 
+        progress = QtWidgets.QProgressDialog(
+            "Preparing 16 single-light renders…",
+            "Cancel",
+            0,
+            17,
+            self,
+        )
+        progress.setWindowTitle("Processing")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
         contact_images = []
         labels = []
 
-        original_mode = self.mode_combo.currentText()
+        try:
+            self.set_busy("Processing 16 single-light renders…")
+            self.update_info_box(extra="Batch export is in progress; the application has not finished yet.")
 
-        for i in range(16):
-            az = i * 22.5
-            light = az_alt_to_light_vector(az, altitude)
+            for i in range(16):
+                if progress.wasCanceled():
+                    self.update_info_box(extra="Batch export cancelled by user.")
+                    return
 
-            rendered = render_single_light(
-                self.full_nx,
-                self.full_ny,
-                self.full_nz,
-                self.full_alpha,
-                light,
-                params["ambient"],
-                params["gamma"],
-                params["flip_x"],
-                params["flip_y"],
-                params["flip_z"],
-            )
+                az = i * 22.5
+                progress.setLabelText(f"Rendering image {i + 1} of 16 at azimuth {az:.1f}°…")
+                progress.setValue(i)
+                QtWidgets.QApplication.processEvents()
 
-            if params["invert_tones"]:
-                rendered = invert_rendered_uint8(rendered)
+                light = az_alt_to_light_vector(az, altitude)
 
-            az_label = f"{az:05.1f}".replace(".", "p")
-            output_path = outdir / f"{Path(self.normal_path).stem}_hillshade_az_{az_label}_alt_{altitude:.1f}.png"
+                rendered = render_single_light(
+                    self.full_nx,
+                    self.full_ny,
+                    self.full_nz,
+                    self.full_alpha,
+                    light,
+                    params["ambient"],
+                    params["gamma"],
+                    params["flip_x"],
+                    params["flip_y"],
+                    params["flip_z"],
+                )
 
-            self.save_image_with_metadata(
-                rendered,
-                output_path,
-                mode_override="Single light",
-                light_override=light,
-            )
+                if params["invert_tones"]:
+                    rendered = invert_rendered_uint8(rendered)
 
-            # Make small thumbnails for contact sheet
-            thumb = Image.fromarray(rendered, mode="L")
-            thumb.thumbnail((360, 360), Image.Resampling.LANCZOS)
-            contact_images.append(thumb.copy())
-            labels.append(f"Az {az:.1f}°")
+                az_label = f"{az:05.1f}".replace(".", "p")
+                output_path = outdir / f"{Path(self.normal_path).stem}_hillshade_az_{az_label}_alt_{altitude:.1f}.png"
 
-        self.save_contact_sheet(contact_images, labels, outdir / f"{Path(self.normal_path).stem}_contact_sheet.png")
+                progress.setLabelText(f"Saving image {i + 1} of 16…")
+                QtWidgets.QApplication.processEvents()
+
+                self.save_image_with_metadata(
+                    rendered,
+                    output_path,
+                    mode_override="Single light",
+                    light_override=light,
+                )
+
+                # Make small thumbnails for contact sheet
+                thumb = Image.fromarray(rendered, mode="L")
+                thumb.thumbnail((360, 360), Image.Resampling.LANCZOS)
+                contact_images.append(thumb.copy())
+                labels.append(f"Az {az:.1f}°")
+
+                progress.setValue(i + 1)
+                QtWidgets.QApplication.processEvents()
+
+            if progress.wasCanceled():
+                self.update_info_box(extra="Batch export cancelled by user.")
+                return
+
+            progress.setLabelText("Saving contact sheet…")
+            progress.setValue(16)
+            QtWidgets.QApplication.processEvents()
+
+            self.save_contact_sheet(contact_images, labels, outdir / f"{Path(self.normal_path).stem}_contact_sheet.png")
+
+            progress.setValue(17)
+
+        except Exception as exc:
+            self.update_info_box(extra=f"Batch export error: {exc}")
+            return
+        finally:
+            progress.close()
+            self.set_busy(None)
 
         self.update_info_box(extra=f"Saved 16 hillshades to: {outdir}")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Batch export complete",
+            f"Saved 16 hillshades and contact sheet to:\n{outdir}",
+        )
         print(f"Saved 16 hillshades to: {outdir}")
 
     def save_contact_sheet(self, pil_images, labels, out_path: Path, cols: int = 4):
