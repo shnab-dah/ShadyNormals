@@ -49,7 +49,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
 APP_NAME = "Hemisphere Normal Map Hillshade Viewer"
-APP_VERSION = "0.5 - 20260523"
+APP_VERSION = "ALPHA 0.1 - 20260523"
 
 pg.setConfigOptions(imageAxisOrder="row-major")
 
