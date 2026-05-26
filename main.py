@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hemisphere Normal Map Hillshade Viewer
+Normal Map Hillshade Viewer
 ======================================
 
 Interactive viewer for rendering low-relief heritage objects from RGB normal maps.
@@ -20,6 +20,7 @@ Features:
 - full-resolution export
 - PNG/TIFF metadata embedding
 - default output name: {input_filename}_hillshaded.png
+- interactive preview resolution control, defaulting to 50%
 
 Dependencies:
     pip install numpy pillow pyqtgraph PyQt6
@@ -27,10 +28,7 @@ Dependencies:
 Run:
     python main.py
     python main.py normal_map.png
-    python main.py normal_map.png --max-preview-size 1200
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 import argparse
@@ -48,8 +46,8 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 
-APP_NAME = "Hemisphere Normal Map Hillshade Viewer"
-APP_VERSION = "0.7 - 20260523"
+APP_NAME = "Normal Map Hillshade Viewer"
+APP_VERSION = "0.12 - 20260523"
 DEVELOPER_CREDIT = "Developed by Sjors Nab (Utrecht University ArtLab, s.h.nab@uu.nl)"
 LOGO_FILENAME = "logo.png"
 
@@ -214,6 +212,9 @@ def make_preview_image(img: Image.Image, max_preview_size: int) -> Image.Image:
     """
     Resize image for faster interactive preview.
     Full-resolution data is still used when saving.
+
+    This is the legacy maximum-size limiter. The UI also provides a preview
+    percentage control; both limits are respected.
     """
     if max_preview_size <= 0:
         return img.copy()
@@ -221,6 +222,28 @@ def make_preview_image(img: Image.Image, max_preview_size: int) -> Image.Image:
     preview = img.copy()
     preview.thumbnail((max_preview_size, max_preview_size), Image.Resampling.LANCZOS)
     return preview
+
+
+def make_preview_image_percent(img: Image.Image, max_preview_size: int, percent: int) -> Image.Image:
+    """
+    Build the interactive preview image.
+
+    percent is capped by the UI from 1 to 100 and is interpreted literally:
+    100% means the full-resolution source image is used for the preview.
+
+    max_preview_size is kept as a legacy command-line argument but is no longer
+    applied here, because a hidden size cap makes the percentage control
+    misleading. Use a lower preview percentage for performance.
+    """
+    percent = max(1, min(100, int(percent)))
+
+    if percent >= 100:
+        return img.copy()
+
+    w, h = img.size
+    new_w = max(1, int(round(w * percent / 100.0)))
+    new_h = max(1, int(round(h * percent / 100.0)))
+    return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +885,8 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         self.max_preview_size = int(max_preview_size)
 
+        self.full_img = None
+
         self.full_nx = None
         self.full_ny = None
         self.full_nz = None
@@ -897,7 +922,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         if self.normal_path:
             self.load_normal_map(self.normal_path)
         else:
-            self.set_info("No image loaded. Click “Load image” to choose an RGB normal map.")
+            self.set_info("No image loaded. Click “Load image” to choose an RGB normal map. The interactive preview starts at 50%; exports use the full-resolution normal map.")
 
     def _build_ui(self, azimuth, altitude, ambient, gamma):
         central = QtWidgets.QWidget()
@@ -925,21 +950,13 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         # Right control panel.
         #
-        # The controls live inside a QScrollArea so that smaller windows,
-        # high-DPI displays, and fullscreen mode do not cause controls to fall
-        # off the bottom of the screen. The panel keeps a sensible fixed width
-        # while the image viewer takes the remaining space.
-        controls_scroll = QtWidgets.QScrollArea()
-        controls_scroll.setWidgetResizable(True)
-        controls_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        controls_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        controls_scroll.setFixedWidth(390)
-        controls_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-
-        controls = QtWidgets.QWidget()
-        controls.setMinimumWidth(360)
-        controls.setMaximumWidth(380)
-        controls_layout = QtWidgets.QVBoxLayout(controls)
+        # The top part of the panel remains fixed: title/logo, file/export
+        # buttons, status feedback, and render-mode selection. Scrolling starts
+        # below the render-mode selector so the main application controls remain
+        # visible even in smaller windows or fullscreen mode.
+        controls_panel = QtWidgets.QWidget()
+        controls_panel.setFixedWidth(390)
+        controls_layout = QtWidgets.QVBoxLayout(controls_panel)
         controls_layout.setContentsMargins(8, 8, 8, 8)
         controls_layout.setSpacing(6)
 
@@ -973,7 +990,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
         self.load_logo_from_file()
 
-        # Buttons
+        # Fixed top buttons
         self.load_image_button = QtWidgets.QPushButton("Load image")
         self.save_button = QtWidgets.QPushButton("Save current render")
         self.save_16_button = QtWidgets.QPushButton("Save 16 single-light renders")
@@ -1000,31 +1017,42 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         )
         controls_layout.addWidget(self.processing_label)
 
-        # Render mode
-        controls_layout.addSpacing(10)
+        # Render mode remains fixed above the scrolling section.
+        controls_layout.addSpacing(6)
         controls_layout.addWidget(QtWidgets.QLabel("Render mode"))
 
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(RENDER_MODES)
         controls_layout.addWidget(self.mode_combo)
 
+        # Scrollable lower controls
+        lower_scroll = QtWidgets.QScrollArea()
+        lower_scroll.setWidgetResizable(True)
+        lower_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lower_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        lower_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+
+        lower_controls = QtWidgets.QWidget()
+        lower_controls_layout = QtWidgets.QVBoxLayout(lower_controls)
+        lower_controls_layout.setContentsMargins(0, 8, 6, 0)
+        lower_controls_layout.setSpacing(6)
+
         # Hemisphere light control
-        controls_layout.addSpacing(10)
-        controls_layout.addWidget(QtWidgets.QLabel("Light direction hemisphere"))
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Light direction"))
 
         self.light_widget = LightHemisphereWidget()
         self.light_widget.set_from_az_alt(azimuth, altitude)
-        controls_layout.addWidget(self.light_widget, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+        lower_controls_layout.addWidget(self.light_widget, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
 
         # Azimuth / altitude sliders are kept in sync with the hemisphere.
         self.azimuth_slider = self._make_slider(0, 3600, int(azimuth * 10))
         self.altitude_slider = self._make_slider(0, 900, int(altitude * 10))
 
-        controls_layout.addWidget(QtWidgets.QLabel("Azimuth"))
-        controls_layout.addWidget(self.azimuth_slider)
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Azimuth"))
+        lower_controls_layout.addWidget(self.azimuth_slider)
 
-        controls_layout.addWidget(QtWidgets.QLabel("Altitude"))
-        controls_layout.addWidget(self.altitude_slider)
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Altitude"))
+        lower_controls_layout.addWidget(self.altitude_slider)
 
         # Sliders and numeric inputs
         self.ambient_slider = self._make_slider(0, 800, int(ambient * 1000))
@@ -1033,52 +1061,59 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.multi_count_input = self._make_spinbox(4, 32, 16)
         self.local_radius_input = self._make_spinbox(1, 150, 12)
 
-        controls_layout.addSpacing(10)
-        controls_layout.addWidget(QtWidgets.QLabel("Ambient fill"))
-        controls_layout.addWidget(self.ambient_slider)
+        # Start at 50% preview resolution for a better performance/visibility
+        # balance. Full-resolution export is unaffected.
+        self.preview_percent_input = self._make_spinbox(1, 100, 50)
 
-        controls_layout.addWidget(QtWidgets.QLabel("Gamma / display contrast"))
-        controls_layout.addWidget(self.gamma_slider)
+        lower_controls_layout.addSpacing(10)
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Ambient fill"))
+        lower_controls_layout.addWidget(self.ambient_slider)
 
-        controls_layout.addWidget(QtWidgets.QLabel("Multi-light directions"))
-        controls_layout.addWidget(self.multi_count_input)
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Gamma / display contrast"))
+        lower_controls_layout.addWidget(self.gamma_slider)
 
-        controls_layout.addWidget(QtWidgets.QLabel("Local radius"))
-        controls_layout.addWidget(self.local_radius_input)
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Multi-light directions"))
+        lower_controls_layout.addWidget(self.multi_count_input)
+
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Local radius"))
+        lower_controls_layout.addWidget(self.local_radius_input)
+
+        lower_controls_layout.addWidget(QtWidgets.QLabel("Preview resolution (%)"))
+        lower_controls_layout.addWidget(self.preview_percent_input)
 
         # Channel flips
         self.flip_x_box = QtWidgets.QCheckBox("Flip X / Red")
         self.flip_y_box = QtWidgets.QCheckBox("Flip Y / Green")
         self.flip_z_box = QtWidgets.QCheckBox("Flip Z / Blue")
 
-        controls_layout.addSpacing(10)
-        controls_layout.addWidget(self.flip_x_box)
-        controls_layout.addWidget(self.flip_y_box)
-        controls_layout.addWidget(self.flip_z_box)
+        lower_controls_layout.addSpacing(10)
+        lower_controls_layout.addWidget(self.flip_x_box)
+        lower_controls_layout.addWidget(self.flip_y_box)
+        lower_controls_layout.addWidget(self.flip_z_box)
 
         help_label = QtWidgets.QLabel(
-            "Image: mouse wheel = zoom, left-drag = pan.\n"
-            "Control panel: scroll if options do not fit.\n"
-            "Light: drag the white dot inside the hemisphere.\n"
-            "Center = overhead. Edge = grazing light.\n"
-            "Try Flip Y if relief looks inverted.\n\n"
-            "For inscriptions, try Range multi-light, Std-dev multi-light, "
-            "Local normal deviation, or Curvature from normals."
+            "Image viewer: mouse wheel zooms; left-drag pans.\n"
+            "Light control: drag the white dot or use azimuth/altitude sliders.\n"
+            "Preview resolution changes interactive speed/detail only; exports use the full-resolution normal map.\n"
+            "For faint inscriptions, try Range multi-light, Std-dev multi-light, Local normal deviation, or Curvature from normals.\n"
+            "Try Flip Y / Green if relief appears inverted."
         )
         help_label.setWordWrap(True)
 
-        controls_layout.addSpacing(10)
-        controls_layout.addWidget(help_label)
-        controls_layout.addStretch()
+        lower_controls_layout.addSpacing(10)
+        lower_controls_layout.addWidget(help_label)
+        lower_controls_layout.addStretch()
 
-        controls_scroll.setWidget(controls)
-        main_layout.addWidget(controls_scroll)
+        lower_scroll.setWidget(lower_controls)
+        controls_layout.addWidget(lower_scroll, stretch=1)
+
+        main_layout.addWidget(controls_panel)
 
         # Bottom information box
         self.info_box = QtWidgets.QTextEdit()
         self.info_box.setReadOnly(True)
-        self.info_box.setMinimumHeight(85)
-        self.info_box.setMaximumHeight(115)
+        self.info_box.setMinimumHeight(95)
+        self.info_box.setMaximumHeight(130)
         self.info_box.setStyleSheet(
             "QTextEdit { "
             "background: #f7f7f7; "
@@ -1113,6 +1148,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
         self.gamma_slider.valueChanged.connect(self.request_update)
         self.multi_count_input.valueChanged.connect(self.request_update)
         self.local_radius_input.valueChanged.connect(self.request_update)
+        self.preview_percent_input.valueChanged.connect(self.rebuild_preview_from_full_image)
 
         self.flip_x_box.stateChanged.connect(self.request_update)
         self.flip_y_box.stateChanged.connect(self.request_update)
@@ -1271,22 +1307,45 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             self.set_info(f"Could not load image:\n{path}\n\nError: {exc}")
             return
 
-        preview_img = make_preview_image(full_img, self.max_preview_size)
-
+        self.full_img = full_img
         self.full_nx, self.full_ny, self.full_nz, self.full_alpha = decode_normal_map_from_pil(full_img)
-        self.nx, self.ny, self.nz, self.alpha = decode_normal_map_from_pil(preview_img)
 
         self.normal_path = path
         self.output_path = Path(default_output_for_input(path))
-
-        self.preview_size = preview_img.size
         self.full_size = full_img.size
 
         self.setWindowTitle(f"{APP_NAME} — {path.name}")
 
-        self.update_image()
+        self.rebuild_preview_from_full_image()
         self.view.autoRange()
         self.update_info_box(extra=f"Loaded image: {path}")
+
+    def rebuild_preview_from_full_image(self, *args):
+        """
+        Rebuild the interactive preview from the full-resolution source image.
+        This affects preview speed/resolution only. Full-resolution exports
+        always use the original normal map.
+
+        After rebuilding, the view is fitted to the new image extent so that
+        changing the preview percentage, including switching to 100%, does not
+        leave the user looking at only a cropped portion of the image.
+        """
+        if self.full_img is None:
+            return
+
+        preview_img = make_preview_image_percent(
+            self.full_img,
+            self.max_preview_size,
+            self.preview_percent_input.value(),
+        )
+
+        self.nx, self.ny, self.nz, self.alpha = decode_normal_map_from_pil(preview_img)
+        self.preview_size = preview_img.size
+        self.update_image()
+
+        # The preview image dimensions may have changed. Fit the whole image
+        # into the viewport immediately; users can zoom in again afterwards.
+        self.view.autoRange()
 
     def get_params(self):
         light = self.light_widget.get_light()
@@ -1311,6 +1370,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             "gamma": gamma,
             "multi_count": multi_count,
             "local_radius": local_radius,
+            "preview_percent": int(self.preview_percent_input.value()),
             "flip_x": flip_x,
             "flip_y": flip_y,
             "flip_z": flip_z,
@@ -1395,29 +1455,35 @@ class HillshadeViewer(QtWidgets.QMainWindow):
 
     def update_info_box(self, extra=None):
         if self.normal_path is None:
-            self.set_info("No image loaded. Click “Load image” to choose an RGB normal map.")
+            self.set_info(
+                "No image loaded. Click “Load image” to choose an RGB normal map. "
+                "The interactive preview starts at 50%; exports use the full-resolution normal map."
+            )
             return
 
         params = self.get_params()
         light = params["light"]
         azimuth, altitude = light_vector_to_az_alt(light[0], light[1], light[2])
 
+        full_w, full_h = self.full_size if self.full_size else (0, 0)
+        prev_w, prev_h = self.preview_size if self.preview_size else (0, 0)
+
         lines = [
-            f"Image: {self.normal_path}",
-            f"Preview size: {self.preview_size[0]} × {self.preview_size[1]} px    "
-            f"Full size: {self.full_size[0]} × {self.full_size[1]} px",
-            f"Mode: {params['mode']}",
-            f"Light vector: X {light[0]:+.3f}    Y {light[1]:+.3f}    Z {light[2]:+.3f}",
-            f"Azimuth: {azimuth:.1f}°    Altitude: {altitude:.1f}°    "
-            f"Ambient: {params['ambient']:.2f}    Gamma: {params['gamma']:.2f}    "
-            f"Multi-count: {params['multi_count']}    Local radius: {params['local_radius']}",
-            f"Flip X: {params['flip_x']}    Flip Y: {params['flip_y']}    Flip Z: {params['flip_z']}    "
+            f"Source normal map: {self.normal_path}",
+            f"Render mode: {params['mode']}    Output default: {self.output_path}",
+            f"Full-resolution source: {full_w} × {full_h} px    "
+            f"Interactive preview data: {prev_w} × {prev_h} px at {params.get('preview_percent', self.preview_percent_input.value())}%",
+            f"Export behaviour: Save current render and 16-light export use full-resolution normal-map data.",
+            f"Light vector: X {light[0]:+.3f}    Y {light[1]:+.3f}    Z {light[2]:+.3f}    "
+            f"Azimuth: {azimuth:.1f}°    Altitude: {altitude:.1f}°",
+            f"Display/settings: Ambient {params['ambient']:.2f}    Gamma {params['gamma']:.2f}    "
+            f"Multi-light directions {params['multi_count']}    Local radius {params['local_radius']} px",
+            f"Normal-channel flips: X/R {params['flip_x']}    Y/G {params['flip_y']}    Z/B {params['flip_z']}    "
             f"Invert tones: {params['invert_tones']}",
-            f"Default output: {self.output_path}",
         ]
 
         if extra:
-            lines.append(extra)
+            lines.append(str(extra))
 
         self.set_info("\n".join(lines))
 
@@ -1459,6 +1525,7 @@ class HillshadeViewer(QtWidgets.QMainWindow):
             "Gamma": float(params["gamma"]),
             "MultiLightDirections": int(params["multi_count"]),
             "LocalRadiusPixels": int(params["local_radius"]),
+            "PreviewResolutionPercent": int(params.get("preview_percent", self.preview_percent_input.value())),
 
             "FlipX_Red": bool(params["flip_x"]),
             "FlipY_Green": bool(params["flip_y"]),
@@ -1758,9 +1825,8 @@ def main():
         type=int,
         default=1800,
         help=(
-            "Maximum width/height of interactive preview. "
-            "Lower this for faster performance, e.g. 1200. "
-            "Use 0 for full-resolution preview."
+            "Legacy option kept for compatibility. Preview size is controlled "
+            "with the Preview resolution (%) input in the UI."
         ),
     )
 
